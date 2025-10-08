@@ -1,3 +1,5 @@
+ECHO_ONLY = os.getenv("ECHO_ONLY", "false").lower() == "true"
+
 import os
 import json
 import time
@@ -141,6 +143,20 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     messages = build_messages(history, user_text)
 
     # 3) Call Azure OpenAI
+    if ECHO_ONLY:
+        answer = f"(echo) {user_text}"
+    else:
+        # existing call to client.chat.completions.create(...)
+        resp = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0.4,
+        )
+        answer = resp.choices[0].message.content
+
     try:
         resp = client.chat.completions.create(
             model=AZURE_OPENAI_DEPLOYMENT,
