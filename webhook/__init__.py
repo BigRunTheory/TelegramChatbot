@@ -22,6 +22,12 @@ AZURE_TABLES_TABLE_NAME = os.getenv("AZURE_TABLES_TABLE_NAME", "TelegramChatMemo
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+COMMAND_RESPONSES = {
+    "/start": "Hi! I'm your assistant. Ask me anything to get started.",
+    "/help": "Send me a message and I'll do my best to help. Commands: /start, /help, /reset.",
+    "/reset": "Cleared the recent chat memory. We can start fresh!",
+}
+
 # OpenAI client (Azure endpoint)
 client = OpenAI(
     api_key=AZURE_OPENAI_API_KEY,
@@ -34,6 +40,8 @@ class BaseMemoryStore:
     def get(self, chat_id: str) -> List[Dict[str, Any]]:
         raise NotImplementedError
     def put(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
+        raise NotImplementedError
+    def delete(self, chat_id: str) -> None:
         raise NotImplementedError
 
 class InMemoryStore(BaseMemoryStore):
@@ -55,6 +63,9 @@ class InMemoryStore(BaseMemoryStore):
     def put(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
         self._store[chat_id] = {"messages": messages, "exp": time.time() + self._ttl}
 
+    def delete(self, chat_id: str) -> None:
+        self._store.pop(chat_id, None)
+
 class TableStore(BaseMemoryStore):
     """Azure Table Storage backed store (survives restarts/scale)"""
     def __init__(self, conn_str: str, table_name: str):
@@ -66,7 +77,6 @@ class TableStore(BaseMemoryStore):
         return ("chat", str(chat_id))  # PartitionKey, RowKey
 
     def get(self, chat_id: str) -> List[Dict[str, Any]]:
-        from azure.data.tables import TableEntity
         pk, rk = self._key(chat_id)
         try:
             entity = self.table.get_entity(partition_key=pk, row_key=rk)
@@ -85,6 +95,17 @@ class TableStore(BaseMemoryStore):
         }
         # upsert to handle first write / subsequent updates
         self.table.upsert_entity(mode="merge", entity=entity)
+
+    def delete(self, chat_id: str) -> None:
+        from azure.core.exceptions import ResourceNotFoundError
+
+        pk, rk = self._key(chat_id)
+        try:
+            self.table.delete_entity(partition_key=pk, row_key=rk)
+        except ResourceNotFoundError:
+            return
+        except Exception as exc:
+            print(f"[warn] memory_store.delete failed: {exc}")
 
 # Select store
 if AZURE_TABLES_CONNECTION_STRING:
@@ -108,6 +129,22 @@ def clip_history(history: List[Dict[str, Any]], max_turns: int) -> List[Dict[str
     if max_turns <= 0:
         return []
     return history[-max_turns:]
+
+def extract_bot_command(message: Dict[str, Any]) -> Optional[str]:
+    """Return the lower-cased bot command (e.g. '/start') or None."""
+    text = message.get("text") or ""
+    entities = message.get("entities") or []
+
+    for entity in entities:
+        if entity.get("type") == "bot_command" and entity.get("offset", 0) == 0:
+            length = entity.get("length", 0)
+            cmd = text[:length]
+            return cmd.split("@", 1)[0].lower()
+
+    first_token = text.split()[0].lower() if text else ""
+    if first_token.startswith("/"):
+        return first_token.split("@", 1)[0]
+    return None
 
 async def send_telegram_message(chat_id: int, text: str):
     text = text[:4096]  # Telegram hard cap
@@ -133,6 +170,20 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     user_text = msg["text"]
 
     chat_key = str(chat_id)
+
+    command = extract_bot_command(msg)
+    if command:
+        if command == "/reset":
+            try:
+                memory_store.delete(chat_key)
+            except Exception as exc:
+                print(f"[warn] memory_store.delete raised: {exc}")
+        reply = COMMAND_RESPONSES.get(command, "Sorry, I don't recognize that command.")
+        try:
+            await send_telegram_message(chat_id, reply)
+        except Exception as e:
+            print(f"[warn] send_telegram_message failed for command {command}: {e}")
+        return func.HttpResponse("OK", status_code=200)
 
     # 1) Load existing history for this chat
     history = memory_store.get(chat_key)  # list of {"role": "...", "content": "..."}
