@@ -1,0 +1,4 @@
+openai==1.35.7
+httpx==0.27.2
+azure-functions==1.17.0
+azure-data-tables==12.6.0   # only needed if using Table Storage
